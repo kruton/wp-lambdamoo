@@ -7,11 +7,13 @@
  *
  */
 
+#include <netdb.h>
+
 #ifdef OUTBOUND_NETWORK
 static char outbound_network_enabled = OUTBOUND_NETWORK;
 #endif
 
-static in_addr_t bind_local_ip = INADDR_ANY;
+static struct addrinfo *bind_addr;
 
 const char *
 proto_usage_string(void)
@@ -23,7 +25,11 @@ proto_usage_string(void)
 static int
 tcp_arguments(int argc, char **argv, int *pport)
 {
+    struct addrinfo hints;
+    char *host = NULL;
     char *p = 0;
+    char *portstr;
+    int rc;
 
     for ( ; argc > 0; argc--, argv++) {
 	if (argc > 0
@@ -45,9 +51,7 @@ tcp_arguments(int argc, char **argv, int *pport)
                 return 0;
             argc--;
             argv++;
-            bind_local_ip = inet_addr(argv[0]);
-            if (bind_local_ip == INADDR_NONE)
-                return 0;
+            host = argv[0];
 	    oklog("CMDLINE: Source address restricted to %s\n", argv[0]);
         }
         else {
@@ -65,6 +69,20 @@ tcp_arguments(int argc, char **argv, int *pport)
 	    oklog("CMDLINE: Initial port = %d\n", *pport);
         }
     }
+
+    memset(&hints, '\0', sizeof(hints));
+    hints.ai_family = PF_UNSPEC;
+    hints.ai_flags = AI_PASSIVE | AI_V4MAPPED | AI_ADDRCONFIG;
+    hints.ai_socktype = SOCK_STREAM;
+    asprintf(&portstr, "%u", *pport);
+    rc = getaddrinfo(host, portstr, &hints, &bind_addr);
+    free(portstr);
+    if (rc != 0) {
+	errlog("Could not find listening address %s: %s\n", host,
+	       gai_strerror(rc));
+        return 0;
+    }
+
 #ifdef OUTBOUND_NETWORK
     oklog("CMDLINE: Outbound network connections %s.\n", 
           outbound_network_enabled ? "enabled" : "disabled");

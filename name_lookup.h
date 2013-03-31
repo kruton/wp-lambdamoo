@@ -31,15 +31,16 @@ extern int initialize_name_lookup(void);
 				 * this succeeds.
 				 */
 
-extern uint32_t lookup_addr_from_name(const char *name,
+extern int lookup_addr_from_name(const char *name,
+				      struct sockaddr* addr,
 				      unsigned timeout);
-				/* Translate a host name to a 32-bit
+				/* Translate a host name to an
 				 * internet address in host byte order.  If
-				 * anything goes wrong, return 0.  Dotted
+				 * anything goes wrong, return -1.  Dotted
 				 * decimal address are translated properly.
 				 */
 
-extern const char *lookup_name_from_addr(struct sockaddr_in *addr,
+extern const char *lookup_name_from_addr(struct sockaddr* addr,
 					 unsigned timeout);
 				/* Translate an internet address, contained
 				 * in the sockaddr_in, to a host name.  If

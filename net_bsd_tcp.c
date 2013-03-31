@@ -68,10 +68,18 @@ proto_initialize(struct proto *proto, Var * desc, int argc, char **argv)
     return 1;
 }
 
+static int
+get_in_port(struct sockaddr* address) {
+    if (address->sa_family == AF_INET6)
+	return ((struct sockaddr_in6*) address)->sin6_port;
+    else
+	return ((struct sockaddr_in*)address)->sin_port;
+}
+
 enum error
 proto_make_listener(Var desc, int *fd, Var * canon, const char **name)
 {
-    struct sockaddr_in address;
+    struct sockaddr_storage address;
     int s, port, option = 1;
     static Stream *st = 0;
 
@@ -81,42 +89,51 @@ proto_make_listener(Var desc, int *fd, Var * canon, const char **name)
     if (desc.type != TYPE_INT)
 	return E_TYPE;
 
-    port = desc.v.num;
-    s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) {
-	log_perror("Creating listening socket");
-	return E_QUOTA;
-    }
-    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
-		   (char *) &option, sizeof(option)) < 0) {
-	log_perror("Setting listening socket options");
-	close(s);
-	return E_QUOTA;
-    }
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = bind_local_ip;
-    address.sin_port = htons(port);
-    if (bind(s, (struct sockaddr *) &address, sizeof(address)) < 0) {
-	enum error e = E_QUOTA;
+    enum error e = E_QUOTA;
 
-	log_perror("Binding listening socket");
-	if (errno == EACCES)
-	    e = E_PERM;
-	close(s);
+    port = desc.v.num;
+    struct addrinfo *p = bind_addr;
+    while (p != NULL) {
+	s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+	if (s < 0) {
+	    log_perror("Creating listening socket");
+	    p = p->ai_next;
+	    continue;
+	}
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+		       (char *) &option, sizeof(option)) < 0) {
+	    log_perror("Setting listening socket options");
+	    close(s);
+	    p = p->ai_next;
+	    continue;
+	}
+	if (bind(s, p->ai_addr, p->ai_addrlen) < 0) {
+	    log_perror("Binding listening socket");
+	    close(s);
+	    p = p->ai_next;
+	    continue;
+	}
+	if (port == 0) {
+	    socklen_t length = sizeof(address);
+
+	    if (getsockname(s, (struct sockaddr *) &address, &length) < 0) {
+		log_perror("Discovering local port number");
+		if (errno == EACCES)
+		    e = E_PERM;
+		close(s);
+		p = p->ai_next;
+		continue;
+	    }
+	    canon->type = TYPE_INT;
+	    canon->v.num = ntohs(get_in_port((struct sockaddr*)&address));
+	} else
+	    *canon = var_ref(desc);
+	break;
+    }
+
+    if (p == NULL) {
 	return e;
     }
-    if (port == 0) {
-	socklen_t length = sizeof(address);
-
-	if (getsockname(s, (struct sockaddr *) &address, &length) < 0) {
-	    log_perror("Discovering local port number");
-	    close(s);
-	    return E_QUOTA;
-	}
-	canon->type = TYPE_INT;
-	canon->v.num = ntohs(address.sin_port);
-    } else
-	*canon = var_ref(desc);
 
     stream_printf(st, "port %"PRIdN, canon->v.num);
     *name = reset_stream(st);
@@ -138,7 +155,7 @@ proto_accept_connection(int listener_fd, int *read_fd, int *write_fd,
 {
     int timeout = server_int_option("name_lookup_timeout", 5);
     int fd;
-    struct sockaddr_in address;
+    struct sockaddr_storage address;
     socklen_t addr_length = sizeof(address);
     static Stream *s = 0;
 
@@ -154,10 +171,11 @@ proto_accept_connection(int listener_fd, int *read_fd, int *write_fd,
 	    return PA_OTHER;
 	}
     }
+
     *read_fd = *write_fd = fd;
     stream_printf(s, "%s, port %d",
-		  lookup_name_from_addr(&address, timeout),
-		  (int) ntohs(address.sin_port));
+		  lookup_name_from_addr((struct sockaddr*) &address, timeout),
+		  (int) ntohs(get_in_port((struct sockaddr*) &address)));
     *name = reset_stream(s);
     return PA_OKAY;
 }
@@ -199,10 +217,10 @@ proto_open_connection(Var arglist, int *read_fd, int *write_fd,
     static const char *host_name;
     static int port;
     static Timer_ID id;
-    size_t length;
+    socklen_t length;
     int s, result;
     int timeout = server_int_option("name_lookup_timeout", 5);
-    static struct sockaddr_in addr;
+    static struct sockaddr_storage addr;
     static Stream *st1 = 0, *st2 = 0;
 
     if (!outbound_network_enabled)
@@ -221,37 +239,41 @@ proto_open_connection(Var arglist, int *read_fd, int *write_fd,
     host_name = arglist.v.list[1].v.str;
     port = arglist.v.list[2].v.num;
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = lookup_addr_from_name(host_name, timeout);
-    if (addr.sin_addr.s_addr == 0)
+    memset(&addr, '\0', sizeof(addr));
+    if (lookup_addr_from_name(host_name, (struct sockaddr*) &addr, timeout) < 0)
 	return E_INVARG;
+    if (addr.ss_family == AF_INET6)
+	((struct sockaddr_in6*) &addr)->sin6_port = htons(port);
+    else
+	((struct sockaddr_in*) &addr)->sin_port = htons(port);
 
-    s = socket(AF_INET, SOCK_STREAM, 0);
+    s = socket(addr.ss_family, SOCK_STREAM, 0);
     if (s < 0) {
 	if (errno != EMFILE)
 	    log_perror("Making socket in proto_open_connection");
 	return E_QUOTA;
     }
-    
-    if (bind_local_ip != INADDR_ANY) {
-	static struct sockaddr_in local_addr;
 
-	local_addr.sin_family = AF_INET;
-	local_addr.sin_addr.s_addr = bind_local_ip;
-	local_addr.sin_port = 0;
-	/* In theory, if the original listen() succeeded,
-	 * then this should too, but who knows, really? */
-	if (bind(s, (struct sockaddr *) &local_addr, sizeof(local_addr)) < 0) {
-	    enum error e = E_QUOTA;
-
-	    log_perror("Binding local address in proto_open_connection");
+#if 0
+    struct addrinfo *p = bind_addr;
+    enum error e = E_QUOTA;
+    while (p != NULL) {
+	if (bind(s, p->ai_addr, p->ai_addrlen) < 0) {
 	    if (errno == EACCES)
 		e = E_PERM;
-	    close(s);
-	    return e;
+	    p = p->ai_next;
+	    continue;
 	}
-    }	 
+	break;
+    }
+
+    if (p == NULL) {
+	log_perror("Binding local address in proto_open_connection");
+	close(s);
+	return e;
+    }
+#endif
+
     TRY {
 	id = set_timer(server_int_option("outbound_connect_timeout", 5),
 		       timeout_proc, 0);
@@ -283,7 +305,8 @@ proto_open_connection(Var arglist, int *read_fd, int *write_fd,
     }
     *read_fd = *write_fd = s;
 
-    stream_printf(st1, "port %d", (int) ntohs(addr.sin_port));
+    stream_printf(st1, "port %d",
+	          (int) ntohs(get_in_port((struct sockaddr*)&addr)));
     *local_name = reset_stream(st1);
 
     stream_printf(st2, "%s, port %d", host_name, port);

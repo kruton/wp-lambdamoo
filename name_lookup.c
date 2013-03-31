@@ -39,6 +39,7 @@
 
 #include "config.h"
 #include "log.h"
+#include "name_lookup.h"
 #include "server.h"
 #include "storage.h"
 #include "timers.h"
@@ -130,6 +131,26 @@ robust_read(int fd, void *buffer, int len)
     return count;
 }
 
+static int
+get_sockaddr_len(struct sockaddr* addr)
+{
+    if (addr->sa_family == AF_INET6) {
+	return sizeof(struct sockaddr_in6);
+    } else {
+	return sizeof(struct sockaddr_in);
+    }
+}
+
+static struct sockaddr*
+get_in_addr(struct sockaddr* addr)
+{
+    if (addr->sa_family == AF_INET6) {
+	return &(((struct sockaddr_in6*) addr)->sin6_addr);
+    } else {
+	return &(((struct sockaddr_in*) addr)->sin_addr);
+    }
+}
+
 /******************************************************************************
  * Data structures and types used by more than one process.
  *****************************************************************************/
@@ -139,10 +160,11 @@ struct request {
 	REQ_NAME_FROM_ADDR, REQ_ADDR_FROM_NAME
     } kind;
     unsigned timeout;
-    union {
-	unsigned length;
-	struct sockaddr_in address;
-    } u;
+    unsigned length;
+};
+
+struct reply {
+    unsigned length;
 };
 
 /******************************************************************************
@@ -159,10 +181,16 @@ static void
 lookup(int to_intermediary, int from_intermediary)
 {
     struct request req;
+    struct reply reply;
     static char *buffer = 0;
     static int buflen = 0;
     Timer_ID id;
-    struct hostent *e;
+    struct addrinfo hints, *res;
+    struct sockaddr_storage addr;
+    struct sockaddr* sa;
+    char host_name[NI_MAXHOST];
+    int rc;
+    int replysize;
 
     set_server_cmdline("(MOO name-lookup slave)");
     /* Read requests and do them.  Before each, we set a timer.  If it
@@ -171,39 +199,42 @@ lookup(int to_intermediary, int from_intermediary)
     for (;;) {
 	if (robust_read(from_intermediary, &req, sizeof(req)) != sizeof(req))
 	    _exit(1);
+	ensure_buffer(&buffer, &buflen, req.length + 1);
+	memset(buffer, '\0', buflen);
+	if (robust_read(from_intermediary, buffer, req.length)
+	    != req.length)
+	    _exit(1);
+	buffer[req.length] = 0;
 	if (req.kind == REQ_ADDR_FROM_NAME) {
-	    ensure_buffer(&buffer, &buflen, req.u.length + 1);
-	    if (robust_read(from_intermediary, buffer, req.u.length)
-		!= req.u.length)
-		_exit(1);
-	    buffer[req.u.length] = 0;
+	    memset(&hints, 0, sizeof(hints));
+	    hints.ai_family = PF_UNSPEC;
+	    hints.ai_socktype = SOCK_STREAM;
 	    id = set_timer(req.timeout, timeout_proc, 0);
-	    /* This cast is to work around systems like NeXT that declare
-	     * gethostbyname() to take a non-const string pointer.
-	     */
-	    e = gethostbyname((void *) buffer);
+	    rc = getaddrinfo(buffer, NULL, &hints, &res);
 	    cancel_timer(id);
-	    if (e && e->h_length == sizeof(uint32_t))
-		write(to_intermediary, e->h_addr_list[0], e->h_length);
-	    else {
-		uint32_t addr;
-
-		/* This cast is for the same reason as the one above... */
-		addr = inet_addr((void *) buffer);
-		write(to_intermediary, &addr, sizeof(addr));
+	    if (rc != 0) {
+		reply.length = 0;
+		write(to_intermediary, &reply, sizeof(reply));
+	    } else {
+		reply.length = res->ai_addrlen;
+		write(to_intermediary, &reply, sizeof(reply));
+		write(to_intermediary, res->ai_addr, reply.length);
+		freeaddrinfo(res);
 	    }
 	} else {
-	    const char *host_name;
-	    int length;
+	    sa = (struct sockaddr*) buffer;
 	    id = set_timer(req.timeout, timeout_proc, 0);
-	    e = gethostbyaddr((void *) &req.u.address.sin_addr,
-			      sizeof(req.u.address.sin_addr),
-			      AF_INET);
+	    rc = getnameinfo(sa, req.length, host_name, sizeof(host_name),
+		    NULL, 0, NI_NAMEREQD);
 	    cancel_timer(id);
-	    host_name = e ? e->h_name : "";
-	    length = strlen(host_name);
-	    write(to_intermediary, &length, sizeof(length));
-	    write(to_intermediary, host_name, length);
+	    if (rc != 0) {
+		reply.length = 0;
+		write(to_intermediary, &reply, sizeof(reply));
+	    } else {
+		reply.length = strlen(host_name);
+		write(to_intermediary, &reply, sizeof(reply));
+		write(to_intermediary, host_name, reply.length);
+	    }
 	}
     }
 }
@@ -236,10 +267,9 @@ static void
 intermediary(int to_server, int from_server)
 {
     struct request req;
+    struct reply reply;
     static char *buffer = 0;
     static int buflen = 0;
-    int len;
-    uint32_t addr;
 
     set_server_cmdline("(MOO name-lookup master)");
     signal(SIGPIPE, SIG_IGN);
@@ -247,44 +277,33 @@ intermediary(int to_server, int from_server)
     for (;;) {
 	if (robust_read(from_server, &req, sizeof(req)) != sizeof(req))
 	    _exit(1);
-	if (req.kind == REQ_ADDR_FROM_NAME) {
-	    ensure_buffer(&buffer, &buflen, req.u.length);
-	    if (robust_read(from_server, buffer, req.u.length) != req.u.length)
-		_exit(1);
-	}
+	ensure_buffer(&buffer, &buflen, req.length);
+	if (robust_read(from_server, buffer, req.length) != req.length)
+	    _exit(1);
 	if (!lookup_pid)	/* Restart lookup if it's died */
 	    restart_lookup();
 	if (lookup_pid) {	/* Only try to deal with lookup if alive */
 	    write(to_lookup, &req, sizeof(req));
-	    if (req.kind == REQ_ADDR_FROM_NAME) {
-		write(to_lookup, buffer, req.u.length);
-		if (robust_read(from_lookup, &addr, sizeof(addr))
-		    != sizeof(addr)) {
-		    restart_lookup();
-		    addr = 0;
-		}
-		write(to_server, &addr, sizeof(addr));
+	    write(to_lookup, buffer, req.length);
+	    if (robust_read(from_lookup, &reply, sizeof(reply))
+		!= sizeof(reply)) {
+		restart_lookup();
+		reply.length = 0;
 	    } else {
-		if (robust_read(from_lookup, &len, sizeof(len))
-		    != sizeof(len)) {
+		ensure_buffer(&buffer, &buflen, reply.length);
+		if (reply.length > 0
+		    && robust_read(from_lookup, buffer, reply.length) != reply.length) {
 		    restart_lookup();
-		    len = 0;
-		} else {
-		    ensure_buffer(&buffer, &buflen, len);
-		    if (len > 0
-			&& robust_read(from_lookup, buffer, len) != len) {
-			restart_lookup();
-			len = 0;
-		    }
+		    reply.length = 0;
 		}
-		write(to_server, &len, sizeof(len));
-		if (len > 0)
-		    write(to_server, buffer, len);
 	    }
+	    write(to_server, &reply, sizeof(reply));
+	    if (reply.length > 0)
+		write(to_server, buffer, reply.length);
 	} else {		/* Lookup dead and wouldn't restart ... */
-	    int failure = 0;
+	    reply.length = 0;
 
-	    write(to_server, &failure, sizeof(failure));
+	    write(to_server, &reply, sizeof(reply));
 	}
     }
 }
@@ -314,29 +333,31 @@ abandon_intermediary(const char *prefix)
 }
 
 const char *
-lookup_name_from_addr(struct sockaddr_in *addr, unsigned timeout)
+lookup_name_from_addr(struct sockaddr* addr, unsigned timeout)
 {
     struct request req;
+    struct reply reply;
     static char *buffer = 0;
     static int buflen = 0;
-    int len;
 
     if (!dead_intermediary) {
 	req.kind = REQ_NAME_FROM_ADDR;
 	req.timeout = timeout;
-	req.u.address = *addr;
-	if (write(to_intermediary, &req, sizeof(req)) != sizeof(req))
+	req.length = get_sockaddr_len(addr);
+	if (write(to_intermediary, &req, sizeof(req)) != sizeof(req) ||
+		write(to_intermediary, addr, req.length) != req.length)
 	    abandon_intermediary("LOOKUP_NAME: Write to intermediary failed");
-	else if (robust_read(from_intermediary, &len, sizeof(len))
-		 != sizeof(len))
+	else if (robust_read(from_intermediary, &reply, sizeof(reply))
+		 != sizeof(reply))
 	    abandon_intermediary("LOOKUP_NAME: Read from intermediary failed");
-	else if (len != 0) {
-	    ensure_buffer(&buffer, &buflen, len + 1);
-	    if (robust_read(from_intermediary, buffer, len) != len)
+	else if (reply.length != 0) {
+	    ensure_buffer(&buffer, &buflen, reply.length + 1);
+	    if (robust_read(from_intermediary, buffer, reply.length)
+		!= reply.length)
 		abandon_intermediary("LOOKUP_NAME: "
 				   "Data-read from intermediary failed");
 	    else {
-		buffer[len] = '\0';
+		buffer[reply.length] = '\0';
 		return buffer;
 	    }
 	}
@@ -347,38 +368,43 @@ lookup_name_from_addr(struct sockaddr_in *addr, unsigned timeout)
      */
 
     {
-	static char decimal[20];
-	uint32_t a = ntohl(addr->sin_addr.s_addr);
-
-	sprintf(decimal, "%u.%u.%u.%u",
-		(unsigned) (a >> 24) & 0xff, (unsigned) (a >> 16) & 0xff,
-		(unsigned) (a >> 8) & 0xff, (unsigned) a & 0xff);
-	return decimal;
+	static char str6[INET6_ADDRSTRLEN];
+	inet_ntop(addr->sa_family, get_in_addr(addr), str6, INET6_ADDRSTRLEN);
+	return str6;
     }
 }
 
-uint32_t
-lookup_addr_from_name(const char *name, unsigned timeout)
+int
+lookup_addr_from_name(const char *name, struct sockaddr* addr, unsigned timeout)
 {
     struct request req;
-    uint32_t addr = 0;
+    struct reply reply;
 
     if (dead_intermediary) {
 	/* Numeric addresses should always work... */
-	addr = inet_addr((void *) name);
+	addr->sa_family = AF_INET6;
+	return inet_pton(addr->sa_family, name, get_in_addr(addr));
     } else {
 	req.kind = REQ_ADDR_FROM_NAME;
 	req.timeout = timeout;
-	req.u.length = strlen(name);
+	req.length = strlen(name);
 	if (write(to_intermediary, &req, sizeof(req)) != sizeof(req)
-	    || write(to_intermediary, name, req.u.length) != req.u.length)
+	    || write(to_intermediary, name, req.length) != req.length) {
 	    abandon_intermediary("LOOKUP_ADDR: Write to intermediary failed");
-	else if (robust_read(from_intermediary, &addr, sizeof(addr))
-		 != sizeof(addr))
+	    return -1;
+	} else if (robust_read(from_intermediary, &reply, sizeof(reply))
+		 != sizeof(reply)) {
 	    abandon_intermediary("LOOKUP_ADDR: Read from intermediary failed");
+	    return -1;
+	} else if (reply.length > 0
+		 && robust_read(from_intermediary, addr, reply.length)
+			!= reply.length) {
+	    abandon_intermediary("LOOKUP_ADDR: Data-read from intermediary failed");
+	    return -1;
+	} else {
+	    return 0;
+	}
     }
-
-    return addr == 0xffffffff ? 0 : addr;
 }
 
 #endif				/* NETWORK_PROTOCOL == NP_TCP */
